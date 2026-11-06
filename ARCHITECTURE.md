@@ -42,6 +42,41 @@ For a batch, all operation records and then one commit frame are appended before
 
 If a process dies before the acknowledgment, the operation may be absent or present. If it dies after `fsync()` but before the response reaches the caller, recovery may find the complete record or committed batch and apply it; this is allowed by the challenge invariant.
 
+## Comprehensive architecture diagram
+
+```mermaid
+flowchart LR
+    API[Client API / CLI / serve] --> LOCK[One process-wide RLock]
+    LOCK --> GUARD[Validate keys and values\npreflight max_bytes]
+    GUARD --> WRITER[Encode framed records]
+    WRITER --> FILE[Authoritative append-only file]
+    FILE --> LAYOUT[On-disk frame layout\nmagic 4 | version 1 | type 1 | txid 8\nkey_len 4 | value_len 4 | op_index 4 | op_count 4\npayload | CRC32 4]
+    WRITER --> SYNC[flush + os.fsync]
+    SYNC --> INDEX[Update in-memory index]
+    INDEX --> ACK[Return success]
+    WRITER --> COMMIT[Batch operation frames\nthen committed commit frame]
+    COMMIT --> SYNC
+    INDEX --> READ[Reads under same RLock]
+    FILE --> RECOVER[open: sequential validation\nCRC, lengths, commit/count checks]
+    RECOVER --> REPLAY[Replay valid prefix\nstage batches until commit]
+    REPLAY --> INDEX
+    INDEX --> COMPACT[Compaction under RLock]
+    COMPACT --> TMP[Write compact.tmp\nflush + fsync]
+    TMP --> SWAP[os.replace + directory fsync]
+    SWAP --> FILE
+    GUARD -. reject before write .-> ERROR[DiskFullError]
+```
+
+The exact fixed header is 30 bytes: `magic[4] + version[1] + record_type[1] + txid[8] + key_length[4] + value_length[4] + op_index[4] + op_count[4]`; the payload is `key_length + value_length` bytes and the CRC trailer is 4 bytes. A batch commit frame has a zero-length key and a 4-byte batch CRC payload.
+
+## Three guarantee arguments
+
+**Durability.** For each acknowledged put, delete, or batch, `_durable_append()` writes all complete frames, calls `flush()`, and then calls `os.fsync()` on the database file descriptor before the public method updates the in-memory index or returns success. Compaction follows the same rule for its temporary file and additionally fsyncs the containing directory after `os.replace()`. Therefore the implementation never intentionally acknowledges a write before its durable synchronization point.
+
+**Atomicity.** A batch is encoded as operation frames sharing a transaction ID, followed by one commit frame containing the expected operation count and a CRC32 over the exact operation frames. Recovery stages operation frames in `pending` and applies them to the index only after the commit frame validates. The global `RLock` also prevents a concurrent reader from observing the index between individual batch updates. A missing, torn, or invalid commit leaves the staged batch unapplied.
+
+**Recoverability.** `open()` scans the authoritative file from byte zero, validating the magic, version, record type, declared lengths, frame completeness, and CRC32 before applying a record. It stops at the first invalid or incomplete tail, truncates the file to `last_good`, flushes, and fsyncs the repaired prefix before reopening for append. Valid committed batches are replayed, while incomplete batches remain invisible. This makes recovery deterministic for the valid prefix and prevents malformed tail bytes from becoming database state; exact kill injection at every individual system-call boundary remains outside the current test evidence.
+
 ## Recovery flow
 
 ```mermaid
@@ -80,12 +115,16 @@ Before any normal append, `_durable_append()` calculates the current file size p
 
 The parent of `torture.py` owns an independent dictionary oracle. It does not use `dump` or the database's own index as expected truth. Each child operation is considered acknowledged only after a response is received. After a random `SIGKILL`, the child is restarted and the observed state must equal the state before or after the unacknowledged operation. For a batch, the full state must equal one complete before/after state, not a mixture.
 
-Observed run:
+Observed 500-iteration run:
 
 ```text
-python3 torture.py run --iterations 100 --seed 424242
-crash_test: 100 iterations, 68 acknowledged, 32 killed, 12 keys checked
+python3 torture.py run --iterations 500 --seed 12345
+crash_test: 500 iterations, 306 acknowledged, 194 killed, 12 keys checked
 thread_test: 4 threads, 160 writes, 160 present
+python3 torture.py run --iterations 100 --seed 999 --mode large-values
+large_values_test: 100 iterations, 1 MiB values, 4 keys checked, reopen passed
+python3 torture.py run --iterations 100 --seed 7 --mode compaction
+compaction_test: 4,958 bytes before, 773 bytes after, 20 keys checked
 ```
 
 The engine unit suite also passed six tests, including persistence, incomplete tail, incomplete batch, compaction shrink/reopen, and logical size-limit rejection.
@@ -128,7 +167,7 @@ Status meanings:
 | E3 | Cap reached then process killed | `DiskFullError`, `_recover` | Not verified with a kill after a capped failure. |
 | E4 | Cap reached during compaction | `compact` | Partial: compacted output checks `max_bytes` before replacement; a direct cap-during-compaction test was not run. |
 | E5 | Deletes free space and later writes work | `delete`, `compact` | Partial: deletes plus compaction shrink was tested; a separate post-compaction write-after-space test is not recorded. |
-| F1 | 500 consecutive random kills/restarts | `torture.py` | Partial: 100 iterations with 32 kills passed; 500 was not run. |
+| F1 | 500 consecutive random kills/restarts | `torture.py` | Verified: 500 iterations with 194 kills and 306 acknowledgments passed with seed 12345. |
 | F2 | Repeated kills during recovery | `_recover` | Not verified: no recovery-stage kill failpoint. |
 | F3 | 1,000,000 keys and under-2-second recovery | `_recover` | Not verified: no million-key benchmark was run. |
 | F4 | Hand-truncate final byte | `_recover` | Partial: an incomplete appended tail was repaired; exact one-byte truncation of a valid final record was not run. |
