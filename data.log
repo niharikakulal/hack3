@@ -1,0 +1,22 @@
+import os
+
+f = open("data.log", "ab")   # "ab" = append, binary
+
+def put(key, value):
+    line = f"PUT {key} {value}\n".encode()
+    f.write(line)        # 1. write the line
+    f.flush()            # 2. push from Python to the OS
+    os.fsync(f.fileno()) # 3. push from the OS to the disk
+    # only now is it safe to say "done"
+
+def delete(key):
+    line = f"DELETE {key}\n".encode()
+    f.write(line)
+    f.flush()
+    os.fsync(f.fileno())
+
+put("name", "Alice")
+put("age", "25")
+delete("age")
+put("name", "Bob")
+print("done")
