@@ -1,10 +1,10 @@
-import subprocess, threading, random, time, sys, os
+ subprocess, threading, random, time, sys, os
 
 ENGINE = [sys.executable, "engine.py"]
 acked = {}      # key -> last ACKed value (None = deleted)
 maybe = {}      # key -> set of values from un-ACKed ops
 
-def run_iteration(rng, n):
+def run_iteration(rng, n):import
     pending = {}            # op id -> (key, value)
     lock = threading.Lock()
     counter = [0]
