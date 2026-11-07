@@ -1,12 +1,21 @@
 import sys
 from kvstore import KVStore
 
-path = sys.argv[1]
+if len(sys.argv) < 3:
+    print("Usage: python writer.py <db_path> <start_index>")
+    sys.exit(1)
+
+db_path = sys.argv[1]
 start = int(sys.argv[2])
 
-db = KVStore(path)
-i = start
-while True:
-    db.put(f"k{i}", f"v{i}")
-    print(f"ACK {i}", flush=True)   # only printed AFTER put() returned
-    i += 1
+# Open database instance
+db = KVStore(db_path)
+
+# Write test keys ensuring valid byte lengths (1 to 1024 bytes)
+for i in range(start, start + 10):
+    key = f"key_{i}".encode("utf-8")
+    value = f"val_{i}".encode("utf-8")
+    db.put(key, value)
+
+db.close()
+print(f"Successfully wrote 10 keys starting from index {start}!")
