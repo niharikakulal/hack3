@@ -4,6 +4,15 @@ import zlib
 
 from kvstore import KVStore, DiskFullError, MAGIC, FRAME_HDR
 
+USAGE = ("usage: kvdb.py [--max-bytes N] "
+         "<open|put|get|del|batch|dump|check|compact|serve> <path> [...]")
+
+# how many arguments each command takes after <path>
+ARG_COUNTS = {
+    "open": 0, "put": 2, "get": 1, "del": 1, "batch": 1,
+    "dump": 0, "check": 0, "compact": 0, "serve": 0,
+}
+
 
 def take_max_bytes(args):
     """Pull '--max-bytes N' out of the argument list, if present."""
@@ -11,7 +20,10 @@ def take_max_bytes(args):
         i = args.index("--max-bytes")
         if i + 1 >= len(args):
             raise ValueError("--max-bytes requires a value")
-        value = int(args[i + 1])
+        try:
+            value = int(args[i + 1])
+        except ValueError:
+            raise ValueError("--max-bytes must be a whole number")
         del args[i:i + 2]
         return value
     return None
@@ -58,7 +70,7 @@ def cmd_batch(path, max_bytes, file):
     ops = []
     with open(file, encoding="utf-8") as f:
         for line in f:
-            line = line.rstrip("\n")
+            line = line.rstrip("\r\n")
             if not line:
                 continue
             parts = line.split(" ", 2)
@@ -136,12 +148,91 @@ def cmd_check(path):
 def cmd_serve(path, max_bytes):
     db = KVStore(path, max_bytes)
     print("READY", flush=True)
-
+    counter = 0          # operation numbers for the plain-text commands
+    batch = None         # None = not inside a batch, otherwise the queued operations
     for line in sys.stdin:
-        parts = line.rstrip("\n").split(" ")
-        if len(parts) < 2:
+        line = line.rstrip("\r\n")
+        words = line.split(" ", 2)
+        cmd = words[0]
+
+        # ---- plain-text commands (lowercase): easy to type by hand ----
+        if cmd in ("put", "del", "get", "begin", "commit", "abort"):
+            if cmd == "get":
+                if len(words) < 2:
+                    print("ERR usage: get <key>", flush=True)
+                    continue
+                value = db.get(words[1].encode())
+                if value is None:
+                    print("NOTFOUND", flush=True)
+                else:
+                    print("VALUE " + value.decode(errors="replace"), flush=True)
+                continue
+            if cmd == "begin":
+                if batch is not None:
+                    print("ERR already in a batch", flush=True)
+                else:
+                    batch = []
+                    print("BEGIN", flush=True)
+                continue
+            if cmd == "abort":
+                if batch is None:
+                    print("ERR not in a batch", flush=True)
+                else:
+                    batch = None
+                    print("ABORTED", flush=True)
+                continue
+            if cmd == "commit":
+                if batch is None:
+                    print("ERR not in a batch", flush=True)
+                    continue
+                ops, batch = batch, None
+                if not ops:
+                    print("ERR empty batch", flush=True)
+                    continue
+                counter += 1
+                try:
+                    db.batch(ops)
+                except DiskFullError:
+                    print(f"ERR {counter} diskfull", flush=True)
+                    continue
+                except ValueError:
+                    print(f"ERR {counter} invalid", flush=True)
+                    continue
+                print(f"ACK {counter}", flush=True)   # printed only after the fsync
+                continue
+            # put or del
+            if len(words) < 2:
+                print("ERR usage: put <key> <value>  or  del <key>", flush=True)
+                continue
+            key = words[1].encode()
+            if cmd == "put":
+                value = words[2].encode() if len(words) > 2 else b""
+                op = ("put", key, value)
+            else:
+                op = ("del", key)
+            if batch is not None:
+                batch.append(op)                       # queued only, nothing written yet
+                print(f"QUEUED ({len(batch)} in batch)", flush=True)
+                continue
+            counter += 1
+            try:
+                if op[0] == "put":
+                    db.put(op[1], op[2])
+                else:
+                    db.delete(op[1])
+            except DiskFullError:
+                print(f"ERR {counter} diskfull", flush=True)
+                continue
+            except ValueError:
+                print(f"ERR {counter} invalid", flush=True)
+                continue
+            print(f"ACK {counter}", flush=True)
             continue
 
+        # ---- hex protocol (uppercase): used by the torture tool ----
+        parts = line.split(" ")
+        if len(parts) < 2:
+            continue
         cmd, op_id = parts[0], parts[1]
         try:
             if cmd == "PUT":
@@ -154,38 +245,43 @@ def cmd_serve(path, max_bytes):
                     f = tok.split(":")
                     if f[0] == "put":
                         ops.append(("put", bytes.fromhex(f[1]), bytes.fromhex(f[2])))
-                    elif f[0] == "del":
-                        ops.append(("del", bytes.fromhex(f[1]), b""))
                     else:
-                        raise ValueError("unknown batch operation")
+                        ops.append(("del", bytes.fromhex(f[1])))
                 db.batch(ops)
             else:
                 print(f"ERR {op_id} unknown-command", flush=True)
                 continue
-
         except DiskFullError:
             print(f"ERR {op_id} diskfull", flush=True)
             continue
         except (ValueError, IndexError):
             print(f"ERR {op_id} invalid", flush=True)
             continue
-
         print(f"ACK {op_id}", flush=True)
-
     db.close()
 
 
 def main():
     args = sys.argv[1:]
-    max_bytes = take_max_bytes(args)
-
-    if len(args) < 2:
-        print("usage: kvdb.py [--max-bytes N] <open|put|get|del|batch|dump|check|compact|serve> <path> [...]")
-        sys.exit(1)
-
-    cmd, path, rest = args[0], args[1], args[2:]
 
     try:
+        max_bytes = take_max_bytes(args)
+
+        if len(args) < 2:
+            print(USAGE)
+            sys.exit(1)
+
+        cmd, path, rest = args[0], args[1], args[2:]
+
+        if cmd not in ARG_COUNTS:
+            print("unknown command:", cmd)
+            print(USAGE)
+            sys.exit(1)
+        if len(rest) != ARG_COUNTS[cmd]:
+            print(f"ERROR: '{cmd}' takes {ARG_COUNTS[cmd]} argument(s) after the path")
+            print(USAGE)
+            sys.exit(1)
+
         if cmd == "open":
             cmd_open(path, max_bytes)
         elif cmd == "put":
@@ -204,16 +300,15 @@ def main():
             cmd_compact(path, max_bytes)
         elif cmd == "serve":
             cmd_serve(path, max_bytes)
-        else:
-            print("unknown command:", cmd)
-            sys.exit(1)
 
     except DiskFullError:
         print("ERROR: disk full (size limit reached)")
         sys.exit(1)
-    except (ValueError, IndexError) as exc:
+    except (ValueError, IndexError, OSError) as exc:
         print(f"ERROR: {exc}")
         sys.exit(1)
+    except KeyboardInterrupt:
+        sys.exit(130)       # Ctrl+C: stop quietly, without a traceback
 
 
 main()
