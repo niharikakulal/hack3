@@ -1,12 +1,15 @@
 import os
 import struct
 import threading
+import time
 import zlib
 
 MAGIC = b"KVDB0001"
 FRAME_HDR = struct.Struct("<II")    # payload length, crc32
 OP_PUT, OP_DEL = 1, 2
 MAX_KEY, MAX_VALUE, MAX_BATCH = 1024, 1024 * 1024, 10_000
+COMPACT_FRAME_OPS = 10_000          # compaction writes frames of at most this many operations
+COMPACT_FRAME_BYTES = 4_000_000     # ... and of roughly this many bytes
 
 
 class DiskFullError(Exception):
@@ -16,13 +19,24 @@ class DiskFullError(Exception):
 class KVStore:
     def __init__(self, path, max_bytes=None):
         self.path = path
+        self.temp_path = path + ".compact.tmp"   # only exists while a compaction is running
         self.max_bytes = max_bytes
-        self.lock = threading.Lock()
-        self.index = {}
+        self.lock = threading.Lock()             # one global lock, allowed by the rules
+        self.index = {}                          # key (bytes) -> value (bytes)
+        self.failed = False                      # set if a failed write could not be undone
         self._open_and_recover()
 
     # ---------- recovery ----------
     def _open_and_recover(self):
+        # A temp file can only be left over from a compaction that never reached its
+        # rename, so the real file is still complete. Deleting the temp file is always safe.
+        if os.path.exists(self.temp_path):
+            try:
+                os.remove(self.temp_path)
+            except OSError:
+                pass
+
+        # new file, or a crash while the header was being created
         if not os.path.exists(self.path) or os.path.getsize(self.path) < len(MAGIC):
             with open(self.path, "wb") as f:
                 f.write(MAGIC)
@@ -31,33 +45,27 @@ class KVStore:
 
         with open(self.path, "rb") as f:
             data = f.read()
-
         if data[:len(MAGIC)] != MAGIC:
             raise ValueError("not a KVDB file")
 
         pos = good_end = len(MAGIC)
         n = len(data)
-
         while pos + FRAME_HDR.size <= n:
             length, crc = FRAME_HDR.unpack_from(data, pos)
             start = pos + FRAME_HDR.size
             end = start + length
-
             if end > n:
-                break
-
+                break                          # torn frame: not fully on disk
             payload = data[start:end]
             if zlib.crc32(payload) != crc:
-                break
-
+                break                          # frame is damaged
             ops = self._decode(payload)
             if ops is None:
                 break
-
             self._apply(ops)
             pos = good_end = end
 
-        if good_end < n:
+        if good_end < n:                       # cut off the bad tail
             with open(self.path, "r+b") as f:
                 f.truncate(good_end)
                 f.flush()
@@ -80,136 +88,141 @@ class KVStore:
     @staticmethod
     def _decode(payload):
         try:
-            if len(payload) < 4:
-                return None
-
             (count,) = struct.unpack_from("<I", payload, 0)
-            if count > MAX_BATCH:
-                return None
-
             pos = 4
             ops = []
-
             for _ in range(count):
-                if pos + 9 > len(payload):
-                    return None
-
                 kind, klen, vlen = struct.unpack_from("<BII", payload, pos)
                 pos += 9
-
-                if kind not in (OP_PUT, OP_DEL):
-                    return None
-                if not 1 <= klen <= MAX_KEY or vlen > MAX_VALUE:
-                    return None
-                if kind == OP_DEL and vlen != 0:
-                    return None
-                if pos + klen + vlen > len(payload):
-                    return None
-
                 key = payload[pos:pos + klen]
                 pos += klen
                 val = payload[pos:pos + vlen]
                 pos += vlen
                 ops.append((kind, key, val))
-
-            if pos != len(payload):
-                return None
-
             return ops
-        except (struct.error, OverflowError):
+        except struct.error:
             return None
 
     def _apply(self, ops):
-        for kind, key, val in ops:
+        for kind, key, val in ops:             # in order: later ops win
             if kind == OP_PUT:
                 self.index[key] = val
-            elif kind == OP_DEL:
+            else:
                 self.index.pop(key, None)
 
     # ---------- the one write path ----------
     def _commit(self, ops):
         frame = self._encode(ops)
         with self.lock:
+            if self.failed:
+                raise OSError("a previous write failed and could not be undone; reopen the database")
             if self.max_bytes is not None and self.size + len(frame) > self.max_bytes:
                 raise DiskFullError("file size limit reached")
-
-            self.f.write(frame)
-            self.f.flush()
-            os.fsync(self.f.fileno())
+            try:
+                self.f.write(frame)
+                self.f.flush()
+                os.fsync(self.f.fileno())      # data is on disk from here
+            except OSError:
+                self._discard_failed_write()   # never leave a torn tail behind a running process
+                raise
             self.size += len(frame)
-            self._apply(ops)
+            self._apply(ops)                   # memory is updated only after the disk
+
+    def _discard_failed_write(self):
+        """A write failed part-way. Cut the file back to the last acknowledged size."""
+        try:
+            self.f.close()
+        except OSError:
+            pass
+        try:
+            with open(self.path, "r+b") as f:
+                f.truncate(self.size)
+                f.flush()
+                os.fsync(f.fileno())
+            self.f = open(self.path, "ab")
+        except OSError:
+            self.failed = True                 # the next open() will drop the torn tail
 
     # ---------- compaction ----------
-    def compact(self):
-        """Rewrite the log with only live key/value pairs.
+    def _compaction_frames(self):
+        """Yield frames that together hold every live key exactly once."""
+        chunk, chunk_bytes = [], 0
+        for key, val in self.index.items():
+            chunk.append((OP_PUT, key, val))
+            chunk_bytes += 9 + len(key) + len(val)
+            if len(chunk) >= COMPACT_FRAME_OPS or chunk_bytes >= COMPACT_FRAME_BYTES:
+                yield self._encode(chunk)
+                chunk, chunk_bytes = [], 0
+        if chunk:
+            yield self._encode(chunk)
 
-        A complete replacement file is fsynced before os.replace() publishes it.
-        A crash before replacement leaves the old database intact; a crash after
-        replacement leaves the new complete database at the original path.
+    @staticmethod
+    def _replace(src, dst):
+        """os.replace, retried briefly: on Windows an antivirus scan can hold a new file for a moment."""
+        for attempt in range(10):
+            try:
+                os.replace(src, dst)
+                return
+            except PermissionError:
+                if attempt == 9:
+                    raise
+                time.sleep(0.05)
+
+    def _sync_directory(self):
+        """Make the rename itself durable. Windows cannot fsync a directory, so it is skipped there."""
+        if os.name == "nt":
+            return
+        fd = os.open(os.path.dirname(os.path.abspath(self.path)), os.O_RDONLY)
+        try:
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+
+    def compact(self):
+        """Rewrite the file so it holds only live keys.
+
+        1. write a complete new file next to the old one (the old file is untouched)
+        2. fsync it, so it is fully on disk
+        3. close our handle to the old file (Windows cannot replace an open file)
+        4. os.replace: atomic, so exactly one of the two files is the database
+        5. reopen the file that now sits at self.path
+        A crash before step 4 leaves the old file complete (plus a temp file that open() deletes).
+        A crash after step 4 leaves the new file complete.
         """
         with self.lock:
-            ops = [
-                (OP_PUT, key, value)
-                for key, value in sorted(self.index.items())
-            ]
-
-            if ops:
-                compacted = MAGIC + self._encode(ops)
-            else:
-                compacted = MAGIC
-
-            if self.max_bytes is not None and len(compacted) > self.max_bytes:
-                raise DiskFullError("compacted database exceeds size limit")
-
-            temp_path = self.path + ".compact.tmp"
-            old_file = self.f
-
+            if self.failed:
+                raise OSError("a previous write failed and could not be undone; reopen the database")
+            written = len(MAGIC)
             try:
-                with open(temp_path, "wb") as temp:
-                    temp.write(compacted)
-                    temp.flush()
-                    os.fsync(temp.fileno())
-
-                # Publish the fully written database atomically.
-                os.replace(temp_path, self.path)
-
-                # Persist the directory entry where supported.
-                directory = os.path.dirname(os.path.abspath(self.path)) or "."
+                with open(self.temp_path, "wb") as t:
+                    t.write(MAGIC)
+                    for frame in self._compaction_frames():
+                        written += len(frame)
+                        if self.max_bytes is not None and written > self.max_bytes:
+                            raise DiskFullError("compacted file would exceed the size limit")
+                        t.write(frame)
+                    t.flush()
+                    os.fsync(t.fileno())
+            except BaseException:
                 try:
-                    dir_fd = os.open(directory, os.O_RDONLY)
-                    try:
-                        os.fsync(dir_fd)
-                    finally:
-                        os.close(dir_fd)
+                    os.remove(self.temp_path)
                 except OSError:
-                    # Some platforms/filesystems do not support directory fsync.
                     pass
+                raise
 
-                # Switch this KVStore instance to the replacement file.
-                self.f = open(self.path, "ab")
-                self.size = len(compacted)
-                old_file.close()
-
-            except Exception:
-                # If replacement did not happen, keep using the old open file.
-                # If replacement did happen, reopen the current path before
-                # propagating the exception.
-                if os.path.exists(self.path):
-                    try:
-                        current_size = os.path.getsize(self.path)
-                        if current_size != self.size:
-                            self.f = open(self.path, "ab")
-                            old_file.close()
-                            self.size = current_size
-                    except OSError:
-                        pass
+            self.f.close()
+            try:
+                self._replace(self.temp_path, self.path)
+            except BaseException:
+                try:
+                    os.remove(self.temp_path)
+                except OSError:
+                    pass
                 raise
             finally:
-                if os.path.exists(temp_path):
-                    try:
-                        os.remove(temp_path)
-                    except OSError:
-                        pass
+                self.f = open(self.path, "ab")   # always reopen whichever file is now at self.path
+            self.size = os.path.getsize(self.path)
+            self._sync_directory()
 
     # ---------- public API ----------
     @staticmethod
@@ -228,9 +241,9 @@ class KVStore:
         self._commit([(OP_DEL, key, b"")])
 
     def batch(self, ops):
+        """ops: list of ("put", key, value) or ("del", key). Applied in order."""
         if not 1 <= len(ops) <= MAX_BATCH:
             raise ValueError("batch must have 1 to 10000 operations")
-
         encoded = []
         for op in ops:
             if op[0] == "put":
@@ -241,7 +254,6 @@ class KVStore:
                 encoded.append((OP_DEL, op[1], b""))
             else:
                 raise ValueError("unknown op")
-
         self._commit(encoded)
 
     def get(self, key):
