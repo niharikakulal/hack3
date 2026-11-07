@@ -7,7 +7,7 @@ import zlib
 MAGIC = b"KVDB0001"
 FRAME_HDR = struct.Struct("<II")    # payload length, crc32
 OP_PUT, OP_DEL = 1, 2
-MAX_KEY, MAX_VALUE, MAX_BATCH = 1024, 1024 * 1024, 10_000
+MAX_KEY, MAX_VALUE, MAX_BATCH = 1024, 1024 * 1024, 10_000  
 COMPACT_FRAME_OPS = 10_000          # compaction writes frames of at most this many operations
 COMPACT_FRAME_BYTES = 4_000_000     # ... and of roughly this many bytes
 
