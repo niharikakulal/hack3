@@ -1,0 +1,177 @@
+"""CLI-level tests for KVDB. They use only the commands documented in README.md.
+
+Run from the repository root:
+    python -m unittest discover tests -v
+"""
+import os
+import subprocess
+import sys
+import tempfile
+import unittest
+from pathlib import Path
+
+KVDB = str(Path(__file__).resolve().parents[1] / "kvdb" / "kvdb.py")
+
+
+def run(*args):
+    """Run one kvdb command, return (returncode, stdout, stderr)."""
+    p = subprocess.run([sys.executable, KVDB, *args],
+                       capture_output=True, text=True, timeout=60)
+    return p.returncode, p.stdout, p.stderr
+
+
+def dump_state(path):
+    """Return the database contents as a dict, using `dump` (key TAB value)."""
+    code, out, err = run("dump", path)
+    assert code == 0, f"dump failed: {err}"
+    state = {}
+    for line in out.splitlines():
+        if line:
+            k, _, v = line.partition("\t")
+            state[k] = v
+    return state
+
+
+class KvdbTests(unittest.TestCase):
+    def setUp(self):
+        self.dir = tempfile.TemporaryDirectory()
+        self.path = os.path.join(self.dir.name, "t.kvdb")
+
+    def tearDown(self):
+        self.dir.cleanup()
+
+    # --- persistence across restart (each command is a new process) ---
+
+    def test_put_get_survives_restart(self):
+        run("put", self.path, "name", "Alice")
+        code, out, _ = run("get", self.path, "name")
+        self.assertEqual(out.strip(), "Alice")
+
+    def test_overwrite_and_delete(self):
+        run("put", self.path, "k", "v1")
+        run("put", self.path, "k", "v2")
+        self.assertEqual(run("get", self.path, "k")[1].strip(), "v2")
+        run("del", self.path, "k")
+        self.assertEqual(run("get", self.path, "k")[1].strip(), "NOTFOUND")
+
+    def test_delete_missing_key_is_not_an_error(self):
+        code, _, _ = run("del", self.path, "never-existed")
+        self.assertEqual(code, 0)
+
+    def test_empty_value(self):
+        run("put", self.path, "k", "")
+        self.assertEqual(dump_state(self.path).get("k"), "")
+
+    # --- batches ---
+
+    def _batch(self, text):
+        bf = os.path.join(self.dir.name, "batch.txt")
+        with open(bf, "w") as f:
+            f.write(text)
+        return run("batch", self.path, bf)
+
+    def test_batch_applies_all_operations(self):
+        code, _, err = self._batch("put a 1\nput b 2\nput c 3\n")
+        self.assertEqual(code, 0, err)
+        self.assertEqual(dump_state(self.path), {"a": "1", "b": "2", "c": "3"})
+
+    def test_batch_put_then_del_same_key_leaves_it_absent(self):  # B5
+        self._batch("put X 1\ndel X\n")
+        self.assertNotIn("X", dump_state(self.path))
+
+    def test_batch_del_then_put_same_key_leaves_it_present(self):  # B5
+        run("put", self.path, "X", "old")
+        self._batch("del X\nput X new\n")
+        self.assertEqual(dump_state(self.path).get("X"), "new")
+
+    # --- check / open ---
+
+    def test_check_reports_ok_on_healthy_file(self):
+        run("put", self.path, "k", "v")
+        code, out, _ = run("check", self.path)
+        self.assertIn("OK", out)
+
+    # --- torn tail (A2, B1, F4) ---
+
+    def test_truncation_at_every_byte_lands_on_a_valid_state(self):
+        """Write 3 puts and a batch. Cut the file at every length.
+        After each cut, open must succeed, check must say OK, and the
+        contents must equal the state after some whole number of operations."""
+        states = [{}]
+        sizes = [os.path.getsize(self.path) if os.path.exists(self.path) else 0]
+
+        def record(new_state):
+            states.append(new_state)
+            sizes.append(os.path.getsize(self.path))
+
+        run("put", self.path, "a", "1");              record({"a": "1"})
+        run("put", self.path, "b", "2");              record({"a": "1", "b": "2"})
+        run("put", self.path, "a", "3");              record({"a": "3", "b": "2"})
+        self._batch("put c 4\nput d 5\ndel b\n")
+        record({"a": "3", "c": "4", "d": "5"})
+
+        with open(self.path, "rb") as f:
+            full = f.read()
+
+        for cut in range(len(full) + 1):
+            broken = os.path.join(self.dir.name, f"cut_{cut}.kvdb")
+            with open(broken, "wb") as f:
+                f.write(full[:cut])
+            code, _, err = run("open", broken)
+            self.assertEqual(code, 0, f"open failed at cut={cut}: {err}")
+            self.assertIn("OK", run("check", broken)[1], f"check not OK at cut={cut}")
+            self.assertIn(dump_state(broken), states,
+                          f"cut={cut} produced a state that is not a prefix of the history")
+            os.remove(broken)
+
+    def test_one_byte_chopped_off_the_end(self):  # F4
+        run("put", self.path, "a", "1")
+        run("put", self.path, "b", "2")
+        with open(self.path, "rb") as f:
+            data = f.read()
+        with open(self.path, "wb") as f:
+            f.write(data[:-1])
+        self.assertEqual(run("open", self.path)[0], 0)
+        state = dump_state(self.path)
+        self.assertEqual(state.get("a"), "1")   # earlier record is intact
+        self.assertNotIn("b", state)            # torn last record is dropped
+
+    def test_recovery_is_repeatable(self):  # F2
+        run("put", self.path, "a", "1")
+        run("put", self.path, "b", "2")
+        with open(self.path, "ab") as f:
+            f.write(b"\x40\x00\x00\x00garbage")   # torn tail
+        first = (run("open", self.path)[0], dump_state(self.path))
+        second = (run("open", self.path)[0], dump_state(self.path))
+        self.assertEqual(first, second)
+        self.assertEqual(first[1], {"a": "1", "b": "2"})
+
+    # --- disk full (E1, E3) ---
+
+    def test_size_limit_fails_cleanly_and_keeps_old_data(self):
+        run("put", self.path, "keep", "me")
+        size = os.path.getsize(self.path)
+        # The documented --max-bytes flag belongs to `open` and `serve`, so
+        # exercise it through serve with a hex-encoded put.
+        key = b"big".hex()
+        val = (b"x" * 5000).hex()
+        p = subprocess.run([sys.executable, KVDB, "serve", self.path, "--max-bytes", str(size + 50)],
+                           input=f"PUT 1 {key} {val}\n", capture_output=True, text=True, timeout=60)
+        self.assertIn("ERR 1 diskfull", p.stdout)
+        self.assertNotIn("ACK 1", p.stdout)
+        self.assertEqual(os.path.getsize(self.path), size)       # nothing written
+        self.assertEqual(dump_state(self.path), {"keep": "me"})  # old data intact
+
+    # --- serve ---
+
+    def test_serve_acks_and_data_is_durable(self):
+        key, val = b"k1".hex(), b"v1".hex()
+        p = subprocess.run([sys.executable, KVDB, "serve", self.path],
+                           input=f"PUT 7 {key} {val}\n", capture_output=True, text=True, timeout=60)
+        self.assertIn("READY", p.stdout)
+        self.assertIn("ACK 7", p.stdout)
+        self.assertEqual(dump_state(self.path), {"k1": "v1"})
+
+
+if __name__ == "__main__":
+    unittest.main()
