@@ -1,161 +1,164 @@
 # ARCHITECTURE.md
 
-Single-file, crash-safe key-value store. Append-only log, one in-memory index, one global lock.
+KVDB: a single-file, crash-safe key-value store. Append-only log of CRC-protected frames, one in-memory index, one global lock. Written in Python (standard library only).
 
-> **Honesty note for judges.** Every mechanism below is a design commitment. The "Where in code" column uses the planned module `src/engine.py`; **rename the functions to match the real code before submitting**, and replace each "Not verified yet" with the real torture mode and seed once you have run it. A row that claims something the code does not do costs points; an honest "not verified" does not.
+> **How to read this document honestly.** It describes the format and write/recovery steps in `README.md`. The "Where in code" column names the file and the step; replace each with the exact function name from `kvdb/kvdb.py`. The "Verified by" column says "Not verified yet" until you have run the named torture mode and can write the real seed. **Compaction is not built**, and the table says so instead of claiming a mechanism.
 
 ---
 
 ## Part 1: Architecture diagram
 
-Source file: `diagrams/architecture.mmd` (same Mermaid text as below).
+Source: `diagrams/architecture.mmd` (identical Mermaid text).
 
 ```mermaid
 flowchart TB
-  CLI["Client API and CLI<br/>open, put, get, delete, batch, close<br/>serve prints ACK id only after the call returns"]
+  CLI["Client API and CLI<br/>open, put, get, del, batch, dump, check, serve<br/>serve prints ACK id only after the write is fsynced"]
 
   subgraph ENGINE["Engine: one process"]
-    LOCK["GLOBAL MUTEX<br/>held for put, delete, batch, compact AND get<br/>so a reader never sees half a batch"]
-    GUARD["Disk-full guard<br/>reject if file_size + record_len exceeds max_bytes<br/>nothing is written when rejected"]
-    ENC["Record encoder<br/>builds the whole record in memory<br/>crc32 covers body_len + body"]
-    IDX["In-memory index<br/>key maps to value offset and value length<br/>rebuilt by recovery, never stored"]
+    LOCK["GLOBAL LOCK<br/>held for every put, delete, batch and get<br/>a reader never sees half a batch"]
+    GUARD["Disk-full guard<br/>if frame would push file past max_bytes<br/>fail with diskfull, write nothing"]
+    ENC["Frame encoder<br/>builds the whole frame in memory<br/>crc32 of the payload"]
+    IDX["In-memory index<br/>key maps to its latest value<br/>rebuilt on every open"]
   end
 
   subgraph WRITE["Write path for put, delete, batch: numbered order"]
-    W1["1 take global mutex"] --> W2["2 disk-full guard"]
-    W2 --> W3["3 encode ONE record<br/>a batch is ONE record<br/>its CRC is the commit marker"]
-    W3 --> W4["4 write whole record at end of file"]
-    W4 --> W5["5 fsync file"]
-    W5 --> W6["6 update in-memory index"]
-    W6 --> W7["7 release mutex, return success, then ACK"]
+    W1["1 take the lock"] --> W2["2 size check: reject if over max_bytes"]
+    W2 --> W3["3 build ONE frame in memory<br/>a batch is ONE frame<br/>its CRC is the commit marker"]
+    W3 --> W4["4 write the frame at end of file, then flush"]
+    W4 --> W5["5 os.fsync the file"]
+    W5 --> W6["6 update the in-memory index"]
+    W6 --> W7["7 release lock, return success, serve prints ACK"]
   end
 
-  FILE["kv.db: the ONE authoritative file<br/>HEADER 16 bytes: magic 8 / version 2 / flags 2 / header_crc 4<br/>RECORD: body_len 4 / crc32 4 / body<br/>body: type 1 / payload<br/>PUT payload: key_len 2 / val_len 4 / key / value<br/>DEL payload: key_len 2 / key<br/>BATCH payload: op_count 4 / ops<br/>each op: op_type 1 / key_len 2 / val_len 4 / key / value"]
+  FILE["data file: the ONE authoritative file<br/>HEADER 8 bytes: KVDB0001<br/>FRAME: length 4 / crc32 4 / payload<br/>payload: op count 4 / ops<br/>OP: type 1 / key len 4 / value len 4 / key / value<br/>type 1 = put, type 2 = delete<br/>crc32 covers the payload only"]
 
   subgraph REC["Recovery on open: safe to repeat"]
-    R1["R1 delete stale kv.db.compact.tmp if present"] --> R2{"R2 file size at least 16 bytes?"}
-    R2 -- no --> R2a["write fresh header, fsync: empty database"]
-    R2 -- yes --> R3["R3 check header magic, version, crc"]
-    R3 --> R4["R4 read next record: length must fit in file, CRC must match"]
-    R4 --> R5{"valid?"}
-    R5 -- yes --> R6["apply its ops to index in order"]
-    R6 --> R4
-    R5 -- "no, or end of file" --> R7["R7 truncate file to end of last valid record, fsync"]
-    R7 --> R8["R8 ready"]
-    R2a --> R8
+    R1{"1 file missing or shorter than 8 bytes?"}
+    R1 -- yes --> R1a["write header, fsync"]
+    R1 -- no --> R2{"2 header is KVDB0001?"}
+    R2 -- no --> R2a["stop with error: not a KVDB file"]
+    R2 -- yes --> R3["3 read next frame: length must fit in file,<br/>CRC must match, payload must decode"]
+    R3 --> R4{"frame valid?"}
+    R4 -- yes --> R3a["apply its ops to the index, in order"]
+    R3a --> R3
+    R4 -- "no, or end of file" --> R5{"4 bytes after last good frame?"}
+    R5 -- yes --> R5a["5 truncate to end of last good frame, fsync"]
+    R5 -- no --> R6["6 open for append: ready"]
+    R5a --> R6
+    R1a --> R6
   end
 
-  subgraph COMP["Compaction: crash-safe swap"]
-    K1["K1 hold mutex"] --> K2["K2 create kv.db.compact.tmp"]
-    K2 --> K3["K3 write header + one PUT per live key<br/>abort and delete tmp if it would exceed max_bytes"]
-    K3 --> K4["K4 fsync tmp"]
-    K4 --> K5["K5 close old file handle"]
-    K5 --> K6["K6 rename tmp over kv.db: the commit point"]
-    K6 --> K7["K7 fsync directory on Linux and macOS"]
-    K7 --> K8["K8 reopen file, swap in new index, release mutex"]
+  subgraph COMP["Compaction: PLANNED, NOT BUILT"]
+    K1["write live keys to a temp file"] --> K2["fsync temp file"]
+    K2 --> K3["atomic replace over the data file"]
+    K3 --> K4["fsync directory on Linux and macOS"]
   end
 
   CLI --> LOCK
   LOCK --> W1
   W4 --> FILE
   W5 --> FILE
-  FILE --> R4
-  K3 -. reads index .-> IDX
-  K6 --> FILE
+  FILE --> R3
   W6 --> IDX
-  R6 --> IDX
+  R3a --> IDX
 ```
 
-**Locks.** There is exactly one lock: a process-wide mutex. `put`, `delete`, `batch`, `get`, `compact` and `close` all take it. This serialises writers and makes batch visibility all-or-nothing for readers. There is no lock file; the engine is single-process.
+**Locks.** There is one lock: a process-wide mutex. `put`, `delete`, `batch` and `get` all take it. Writers are serialised, and a batch is applied to the index entirely inside one lock hold, so a reader sees the state before or after it. There is no lock file; the engine is single-process.
 
 ---
 
-## On-disk format (summary; the full version goes in README.md)
+## On-disk format (full version in README.md)
 
-All integers little-endian. Offsets in bytes.
+All integers little-endian.
 
 ```
-Offset 0   HEADER (16 bytes)
-           0..7    magic        "KVDBLOG1"
-           8..9    version      u16 = 1
-           10..11  flags        u16 = 0
-           12..15  header_crc   u32 = CRC32 of bytes 0..11
-
-Offset 16  RECORD, repeated until end of file
-           +0  body_len  u32   number of bytes in body
-           +4  crc32     u32   CRC32 over (body_len as 4 bytes) followed by body
-           +8  body      body_len bytes
-                 type    u8    1 = PUT, 2 = DEL, 3 = BATCH
-                 PUT:    key_len u16, val_len u32, key, value
-                 DEL:    key_len u16, key
-                 BATCH:  op_count u32, then op_count ops, each:
-                           op_type u8 (1 PUT, 2 DEL), key_len u16,
-                           val_len u32 (0 for DEL), key, value
+HEADER   8 bytes      "KVDB0001"
+FRAME    repeated:    length u32 | crc32 u32 | payload (length bytes)
+                      crc32 = CRC-32 of the payload only
+PAYLOAD               op count u32 | op * count
+OP                    type u8 (1 put, 2 delete) | key len u32 | value len u32 | key | value
 ```
 
-Fixed overhead of a single PUT record is 15 bytes plus key plus value.
+Single put or delete = a frame with op count 1. A batch = one frame with op count 1 to 10,000.
 
-**Why a batch is one record.** A batch is written as a single record with a single CRC. There is no separate commit marker that could be written without the data, or the data without the marker. If the CRC verifies, every byte of every op is on disk; if not, the whole record is ignored. This is the "commit marker": the record's own CRC.
+**Why the CRC is the commit marker.** A batch is one frame with one CRC. There is no separate marker that could reach disk without its data, or the reverse. If the length fits and the CRC matches, every byte of every op is on disk; otherwise the whole frame is ignored.
 
-**Batch ordering rule (scenario B5).** Ops inside a batch are applied in the order listed; the last op on a key wins. `put X, del X` leaves X absent; `del X, put X` leaves X present. The live path and recovery use the same `apply_ops` function, so the result is identical after a crash.
+**Frames that look valid but are not.** Eight zero bytes parse as length 0 and CRC 0, and the CRC-32 of an empty payload is 0. Recovery still rejects it because a payload under 4 bytes cannot hold an op count, so "the payload must decode" fails.
+
+**Batch ordering (B5).** Ops are applied in listed order, later ops win. Recovery applies a frame's ops in the same order as the live path.
 
 ---
 
 ## Part 2: Scenario-to-mechanism proof table
 
-Write-path step numbers (W1 to W7), recovery steps (R1 to R8) and compaction steps (K1 to K8) refer to the diagram above.
+"Write step n" = steps in the write-path box above. "Recovery step n" = the numbered recovery steps in README.md.
 
 | Scenario | Disk state at the moment of the kill | Mechanism that handles it | Where in code | Verified by |
 |---|---|---|---|---|
-| **A1** kill before any bytes of a put reach the file | Before W4. File ends exactly at the last valid record. | Nothing to repair. No ACK was sent, so the put is absent; the old value stays. | `Engine._append`, before the write | Not verified yet. Target: `torture --mode normal` |
-| **A2** torn write, some bytes of the record written | After a partial W4. The file ends with fewer than `8 + body_len` bytes after the last valid record, or the bytes fail the CRC. | R4/R5: the scan stops at the first record that does not fit or fails CRC. R7 truncates to the end of the last valid record. Torn bytes are never applied. | `Engine._recover` | Not verified yet. Target: `torture --mode normal`, plus a hand test that chops the tail |
-| **A3** record fully written, not yet fsynced | Between W4 and W5. A complete valid record is on disk (in the OS cache; a process kill does not discard it). | Recovery sees a valid CRC and applies it. Either outcome is allowed because no ACK was sent. If the OS had lost it instead, it is the A2 case. | `Engine._append`, `Engine._recover` | Not verified yet. Target: `torture --mode normal` |
-| **A4** killed after fsync, before the caller hears success | Between W5 and W7. Complete valid record, fsynced. | Recovery applies it. The key holds the new value even though the caller never got an ACK. | `Engine._append`, `Engine._recover` | Not verified yet. Target: `torture --mode normal` |
-| **A5** killed immediately after put returns | After W7. Complete valid record, fsynced. | `serve` prints ACK only after `put` returns, so every ACK implies W5 already finished. Recovery applies the record. | `Engine.put`, `serve` loop in `src/main` | Not verified yet. Target: `torture --mode normal` |
-| **A6** killed during a delete | Either no record, a torn DEL record, or a complete DEL record. | No record or torn DEL (truncated by R7): old value stays. Complete DEL: key is absent. Never a corrupted value, because a DEL record carries no value. | `Engine.delete`, `Engine._recover` | Not verified yet. Target: `torture --mode normal` |
-| **A7** killed during a 1 MB put | Record of about 1 MB plus overhead, partly written. | Same framing as A1 to A5. The write loop keeps writing until all bytes are out (a single `write` may be short). A partial record fails the length or CRC check and is truncated. | `Engine._append` (write loop), `Engine._recover` | Not verified yet. Target: `torture --mode large-values` |
-| **B1** killed after 3 of 10 batch ops written | The single batch record is incomplete. | The batch is one record, so any missing byte fails length or CRC. R7 truncates it. None of the 10 ops is visible. | `Engine.batch`, `Engine._recover` | Not verified yet. Target: `torture --mode normal` |
-| **B2** all 10 ops written, commit marker not | There is no separate marker. The record is either complete (CRC verifies) or incomplete. "Ops written but marker missing" is the same as B1: the CRC is part of the same record. | Incomplete record is truncated, nothing visible. | `Engine._recover` | Not verified yet. Target: `torture --mode normal` |
-| **B3** commit marker written, not yet fsynced | Between W4 and W5. Complete batch record in the OS cache. | Valid CRC, so all 10 ops are applied together. Never some. | `Engine.batch`, `Engine._recover` | Not verified yet. Target: `torture --mode normal` |
-| **B4** killed after the batch returned | After W7. Complete batch record, fsynced. | All 10 ops are applied at recovery. | `Engine.batch`, `Engine._recover` | Not verified yet. Target: `torture --mode normal` |
-| **B5** put X and delete X in one batch | Same as B3/B4. Ops are stored in the order given. | Ops are applied in listed order, last op wins, using the same `apply_ops` for live and recovery. Rule is stated in README.md. | `Engine.apply_ops` | Not verified yet. Target: unit test in `tests/` |
-| **B6** 10,000-op batch killed halfway | One record, partly written. | Truncated by R7; nothing visible. Recovery time is the scan of the earlier valid records (see F3). | `Engine._recover` | Not verified yet. Target: `torture --mode large-batches` |
-| **C1** killed during open while replaying | Recovery has only read the file, plus possibly R1 (delete tmp). | Replay does not change the file, so running it again gives the same state. | `Engine._recover` | Not verified yet. Target: `torture --mode recovery-crash` |
-| **C2** killed while truncating a torn tail | Either the file is still long (truncate did not happen) or already truncated. | Truncate is to a fixed offset, so repeating it is harmless. Next open finds the torn tail again and truncates again, or finds a clean file. | `Engine._recover` (step R7) | Not verified yet. Target: `torture --mode recovery-crash` |
-| **C3** killed during compaction, before the swap | `kv.db` is untouched. `kv.db.compact.tmp` exists, partly or fully written. | The swap (K6) is the commit point and has not happened, so the old file is authoritative. R1 deletes the stale tmp. | `Engine.compact`, `Engine._recover` (R1) | Not verified yet. Target: `torture --mode compaction` |
-| **C4** killed in the middle of the rename | `kv.db` is either the old file or the new complete file. | Rename is a single atomic filesystem operation (`os.replace`). The new file was fsynced at K4 before the rename, so either version is complete. On Windows the old handle is closed at K5 first, so a kill after K5 and before K6 still leaves the old file. | `Engine.compact` (K4 to K6) | Not verified yet. Target: `torture --mode compaction`. NTFS atomicity not independently checked |
-| **C5** killed after swap, before cleanup | `kv.db` is the new file. The tmp name no longer exists because the rename consumed it. | Nothing is left to clean up. If a stale tmp somehow exists, R1 deletes it. On Linux/macOS the directory fsync (K7) is only needed for power loss; a process kill does not undo a completed rename. | `Engine.compact`, `Engine._recover` (R1) | Not verified yet. Target: `torture --mode compaction` |
-| **C6** killed during close | Every write was already fsynced at W5. `close` only closes handles. | Same as a kill at any other time. | `Engine.close` | Not verified yet. Target: `torture --mode normal` |
-| **D1** two writers, different keys | Records of both writers are in the log in some serial order. | The global mutex lets one writer at a time through W1 to W7. Every ACKed record was fsynced before its mutex release. | `Engine._append` (mutex) | Not verified yet. Target: `torture --mode normal` (2 writers) |
-| **D2** two writers, same key | Both writers' records are in the log, one after the other. | Mutex gives a total order in the log. Replay applies records in log order, so the key holds the last complete record's value. Each value sits inside one CRC-protected record, so values cannot mix. | `Engine._append`, `Engine._recover` | Not verified yet. Target: `torture --mode normal` (shared keys) |
-| **D3** one long batch, other writer doing single puts | The batch is one record; single puts are separate records before or after it. | Mutex makes each operation atomic with respect to the others. A kill mid-batch leaves a torn record (truncated). Single puts that were ACKed were fsynced earlier in the log. | `Engine.batch`, `Engine._append` | Not verified yet. Target: `torture --mode large-batches` |
-| **D4** reader during a batch (no crash) | Not a crash scenario. | `get` takes the same mutex. The index is updated at W6 inside the mutex, with the whole batch applied before release. A reader sees before or after. | `Engine.get`, `Engine.batch` | Not verified yet. Target: threaded unit test in `tests/` |
-| **E1** size cap reached during a single put | Nothing written for that put. | W2: if `file_size + record_len` exceeds `max_bytes`, the engine tries compaction once; if it still does not fit, it raises `DiskFull` before any write. The file and index are unchanged, so reads still work. | `Engine._check_space` | Not verified yet. Target: `torture --mode disk-full` |
-| **E2** cap reached halfway through a batch | Nothing written for that batch. | The guard checks the size of the whole batch record before W4. Since the batch is one record, either it is all written or the call errors with nothing written. | `Engine._check_space`, `Engine.batch` | Not verified yet. Target: `torture --mode disk-full` |
-| **E3** cap reached, then killed | File ends at the last valid record. No partial record exists because the guard rejected the write first. | Normal recovery. All ACKed data intact. | `Engine._check_space`, `Engine._recover` | Not verified yet. Target: `torture --mode disk-full` |
-| **E4** cap reached during compaction | `kv.db` untouched. tmp may be partial. | K3 aborts and deletes tmp if it would pass `max_bytes`; the old file keeps serving. A kill here is scenario C3. | `Engine.compact` (K3) | Not verified yet. Target: `torture --mode disk-full` combined with compaction |
-| **E5** deletes free space, compaction runs, writes work again | Dead bytes (old values, DEL records) are in the log. | Compaction rewrites only live keys, so the file shrinks. Compaction runs automatically when a write would hit the cap or when the file is mostly dead bytes. No manual step. | `Engine.compact`, `Engine._check_space` | Not verified yet. Target: unit test + `torture --mode disk-full` |
-| **F1** 500 random kills and restarts | Any of the states above. | Combination of everything above. | whole engine | Not verified yet. Target: `torture --iterations 500 --seed <n>` |
-| **F2** kill, restart, kill during recovery, again | After the first kill: possible torn tail. After the second: truncate done or not done. | The only things recovery changes are deleting the stale tmp and truncating to a fixed offset. Both are idempotent. | `Engine._recover` | Not verified yet. Target: `torture --mode recovery-crash` |
-| **F3** 1,000,000 keys, killed, then open | Log of about 1M complete records plus maybe a torn tail. | One sequential scan with large buffered reads, no per-record allocations beyond the index entry, no separate index file. **Whether this meets 2 seconds depends on the language and has not been measured.** If it misses, add the checkpoint described below. | `Engine._recover` | **Not verified yet. Must be measured** |
-| **F4** file truncated by 1 byte by hand | Last record is one byte short. | Length does not fit (or CRC fails), so R7 drops that record and truncates. `open` succeeds and all earlier records are intact. | `Engine._recover` | Not verified yet. Target: manual test, step: `truncate -s -1 kv.db`, then `kvdb check` and `kvdb dump` |
+| **A1** kill before any bytes of a put reach the file | Before write step 4. The file ends at the last good frame. | Nothing to repair. No ACK was sent; the key is absent or keeps its previous value. | `kvdb.py`, write path, before step 4 | Default mode, seed 45637: 50/50 iterations passed (random kills) |
+| **A2** torn write | After a partial write step 4. Fewer than `8 + length` bytes follow the last good frame, or the CRC does not match, or the payload does not decode. | Recovery step 3 stops at the first bad frame; recovery step 5 truncates to the end of the last good frame and fsyncs. Torn bytes are never applied or returned. | `kvdb.py`, recovery loop and truncate | Default mode, seed 45637: 50/50 iterations passed (random kills) |
+| **A3** frame fully written, before fsync | Between write steps 4 and 5. A complete valid frame is in the OS cache; a process kill does not discard it. | Recovery sees a valid CRC and applies it. Either outcome is acceptable because no ACK was sent. | `kvdb.py`, write path, steps 4 to 5; recovery loop | Default mode, seed 45637: 50/50 iterations passed (random kills) |
+| **A4** killed after fsync, before the caller hears success | Between write steps 5 and 7. Complete valid frame. | Recovery applies it. The key holds the new value even though the caller never got the ACK. | `kvdb.py`, write path step 5; recovery loop | Default mode, seed 45637: 50/50 iterations passed (random kills) |
+| **A5** killed right after put returns | After write step 7. Complete valid frame, fsynced. | `serve` prints ACK only after the write returns, so every ACK implies the fsync is done. Recovery applies the frame. | `kvdb.py`, `serve` loop | Default mode, seed 45637: 50/50 iterations passed (random kills) |
+| **A6** killed during a delete | No frame, a torn delete frame, or a complete delete frame (op type 2, value len 0). | No frame or torn frame (truncated): old value stays. Complete: key absent. A delete frame carries no value bytes, so it cannot create a corrupted value. | `kvdb.py`, delete path; recovery loop | Default mode, seed 45637: 50/50 iterations passed (random kills) |
+| **A7** killed during a 1 MB put | A frame of about 1 MB plus overhead, partly written. | Same checks as A2: the length field points past the end of the file or the CRC fails, so recovery truncates the frame. | `kvdb.py`, write path; recovery loop | `--mode large-values`. Reported passing by the team. Mode and seed not recorded yet: [FILL IN] |
+| **B1** killed after 3 of 10 batch ops written | One incomplete frame holding the batch. | A batch is one frame, so any missing byte fails the length or CRC check. It is truncated and none of the 10 ops is visible. | `kvdb.py`, batch path; recovery loop | Default mode, seed 45637: 50/50 iterations passed (random kills) |
+| **B2** all 10 ops written, commit marker missing | There is no separate marker. The frame is either complete with a valid CRC, or incomplete. "Ops written, marker missing" is the same as B1. | Incomplete frame is truncated; nothing visible. | `kvdb.py`, recovery loop | Default mode, seed 45637: 50/50 iterations passed (random kills) |
+| **B3** commit marker written, not fsynced | Between write steps 4 and 5. Complete batch frame in the OS cache. | Valid CRC, so all 10 ops are applied together. Never some. | `kvdb.py`, batch path; recovery loop | Default mode, seed 45637: 50/50 iterations passed (random kills) |
+| **B4** killed after the batch returned | After write step 7. Complete batch frame, fsynced. | All 10 ops are applied at recovery. | `kvdb.py`, batch path; recovery loop | Default mode, seed 45637: 50/50 iterations passed (random kills) |
+| **B5** put X and delete X in one batch | Same as B3/B4; ops are stored in the order given. | Ops are applied in listed order and later ops win, in the live path and in recovery. Rule stated in README.md. | `kvdb.py`, batch apply | Reported passing by the team. Test name and result not recorded yet: [FILL IN] |
+| **B6** 10,000-op batch killed halfway | One partial frame. | Truncated by recovery step 5; nothing visible. Recovery time is the scan of the earlier frames (see F3). | `kvdb.py`, recovery loop | `--mode large-batches`. Reported passing by the team. Mode and seed not recorded yet: [FILL IN] |
+| **C1** killed during open while replaying | Recovery has only read frames. If the file was shorter than the header, it may have written the header. | Replay does not modify the file, so running it again reaches the same state. | `kvdb.py`, recovery | Not verified yet. Target: `--mode recovery-crash` |
+| **C2** killed while truncating a torn tail | Either the file is still long (truncate not applied) or already cut. | Truncation is to a fixed offset, so repeating it is harmless. The next open finds the same torn tail and cuts it again, or finds a clean file. | `kvdb.py`, recovery steps 5 | Not verified yet. Target: `--mode recovery-crash` |
+| **C3** killed during compaction before the swap | Not applicable: compaction is not implemented, so there is no temp file or swap. | **No mechanism. Compaction is missing.** | none | Not implemented |
+| **C4** killed during the rename or swap | Not applicable, same reason. | **No mechanism. Compaction is missing.** | none | Not implemented |
+| **C5** killed after the swap, before temp cleanup | Not applicable, same reason. | **No mechanism. Compaction is missing.** | none | Not implemented |
+| **C6** killed during close | Every acknowledged write was fsynced when it happened. | `close` adds nothing that has to be durable, so this is the same as a kill at any other time. (Confirm `close` writes nothing.) | `kvdb.py`, close | Not verified yet. Target: default mode |
+| **D1** two writers, different keys | Frames of both writers are in the log in some serial order. | The global lock lets one operation at a time run write steps 1 to 7. Each ACKed frame was fsynced before its lock release. | `kvdb.py`, lock around write path | Default mode, seed 45637: 50/50 iterations passed (random kills), 2 concurrent writers |
+| **D2** two writers, same key | Both frames are in the log, one after the other. | The lock gives a total order in the log. Recovery replays in log order, so the key holds the last complete frame's value. A value lives inside one CRC-protected frame, so two values never mix. | `kvdb.py`, lock; recovery loop | Default mode, seed 45637: 50/50 iterations passed (random kills), 2 concurrent writers (confirm the writers share keys) |
+| **D3** one long batch, another writer doing single puts | The batch is one frame; single puts are separate frames before or after it. | The lock makes each operation atomic with respect to the others. A kill mid-batch leaves a torn frame (truncated). Single puts that were ACKed were fsynced earlier in the log. | `kvdb.py`, lock; batch path | `--mode large-batches`. Reported passing by the team. Mode and seed not recorded yet: [FILL IN] |
+| **D4** reader during a batch (no crash) | Not a crash scenario. | `get` takes the same lock; the whole batch is applied to the index inside one lock hold. A reader sees before or after. | `kvdb.py`, get; batch path | Reported passing by the team. Test name and result not recorded yet: [FILL IN] |
+| **E1** size cap reached during a single put | Nothing written for that put. | Write step 2: if the frame would exceed `--max-bytes`, the write fails with `ERR <id> diskfull`; file and index are unchanged, so reads still work. | `kvdb.py`, size check | Not verified yet. Target: `tests/test_cli.py` disk-full test |
+| **E2** cap reached halfway through a batch | Nothing written for that batch. | The size check covers the whole batch frame before any byte is written. The batch is all written or fails with nothing written. | `kvdb.py`, size check; batch path | Not verified yet. Target: add a batch case to the disk-full test |
+| **E3** cap reached, then killed | File ends at the last good frame; no partial frame exists because the check rejected the write first. | Normal recovery. All ACKed data intact. | `kvdb.py`, size check; recovery | Not verified yet. Target: disk-full torture mode (not written) |
+| **E4** cap reached during compaction | Not applicable: no compaction. | **No mechanism. Compaction is missing.** | none | Not implemented |
+| **E5** deletes free space, compaction runs, writes work again | Dead frames stay in the file; the file never shrinks. | **Not met.** Without compaction, deletes do not free space, so a database at its cap stays at its cap. | none | Not implemented |
+| **F1** 500 random kills and restarts | Any of the states above. | Combination of everything above. | whole engine | Default mode, seed 45637: 50/50 iterations passed (random kills). The PDF asks for 500 iterations, so run `--iterations 500` and update this cell |
+| **F2** kill, restart, kill during recovery, again | After the first kill, possibly a torn tail. After the second, truncation done or not. | Recovery only reads frames and truncates to a fixed offset, which is repeatable. | `kvdb.py`, recovery | Not verified yet. Target: `--mode recovery-crash` |
+| **F3** 1,000,000 keys, killed, then open | A log of about 1M frames plus maybe a torn tail. | One sequential scan; no index file. **Whether this fits in 2 seconds in Python has not been measured.** | `kvdb.py`, recovery loop | **Not verified yet. Must be measured** |
+| **F4** file truncated by 1 byte | The last frame is one byte short. | Its length does not fit, so recovery drops it and truncates. `open` succeeds and earlier frames are intact. | `kvdb.py`, recovery | Not verified yet. Target: `tests/test_cli.py::test_one_byte_chopped_off_the_end` |
+
+
+### Test evidence recorded so far
+
+| Run | Result |
+|---|---|
+| `torture_v2.py --mode default --seed 45637` | 50/50 iterations passed, 9,533 acknowledged operations, kills between 53 ms and 735 ms, including iterations where an in-flight operation was applied after the kill |
+
+Random kills land at varying points in a write, so this run exercises the A, B and D scenarios statistically. It does not stop at one exact line. The large-value, large-batch and recovery-crash runs, the unit tests, and the 500-iteration run still need their mode, seed and result written down here.
+
+**Still open:** C1, C2 (`--mode recovery-crash`), C3 to C5, E4, E5 (need compaction), E1 to E3 (disk-full runs), C6, F2, F3 (timing at 1,000,000 keys) and F4.
 
 ---
 
 ## Part 3: The three guarantees
 
-**Durability.** A put, delete or batch is encoded as one record in memory, written to the end of `kv.db` with `write()` (looped until every byte is out), and then `fsync(fd)` is called. Only after `fsync` returns does the engine update the index, release the mutex and return, and `serve` prints `ACK <id>` only after the call returns. Therefore every ACK implies the record's bytes were already handed to the disk before the ACK was printed. A kill after the ACK cannot remove them, and recovery re-reads them from the log. On Windows and Linux the kill is a process kill, so the OS keeps written bytes even without `fsync`; the `fsync` is what also protects against power loss.
+**Durability.** A put, delete or batch is built as one frame in memory, written to the end of the file and flushed, and then `os.fsync` is called on the file. The lock is released, success is returned and `serve` prints `ACK <id>` only after that `fsync` returns. So every ACK implies the frame's bytes were already pushed to the disk before the ACK was printed. A kill after the ACK cannot remove them, and recovery re-reads them from the log. The `flush` moves Python's buffer to the OS and the `fsync` moves the OS's copy to disk; a process kill alone never discards bytes already given to the OS, while `fsync` also covers power loss.
 
-**Atomicity.** A batch is a single record whose CRC32 covers its length and every op. Recovery applies a record only if its length fits inside the file and its CRC matches, and it applies all of the ops of that record together. A record that is cut off at any byte fails the length or CRC check and is truncated away by `ftruncate` followed by `fsync`, so none of its ops reach the index. In a running process the batch is applied to the index while holding the global mutex that `get` also needs, so a reader sees the state before the batch or after it.
+**Atomicity.** A batch is a single frame whose CRC-32 covers all of its operations. Recovery applies a frame only if its length fits inside the file, its CRC matches and its payload decodes, and then it applies every operation of that frame in order. A frame cut off at any byte fails one of those checks and is removed by truncating the file to the end of the last good frame and calling `fsync`, so none of its operations reach the index. In a running process the batch is applied to the index while the global lock is held, and `get` needs the same lock, so a reader sees the state before the batch or after it.
 
-**Recoverability.** `open` only reads the file and then changes two things: it deletes `kv.db.compact.tmp` if present, and it truncates the file to the end of the last valid record. Both are idempotent, so a kill at any instruction inside recovery leaves a file that the next recovery handles the same way. A file shorter than the 16-byte header can only come from a kill during first creation, before anything was ever acknowledged, so `open` rewrites a fresh header. Compaction writes a complete new file, calls `fsync` on it, then `rename` (`os.replace`) over the old name, which is atomic; on Linux and macOS the directory is then `fsync`ed so the rename itself survives power loss. A kill before the rename leaves the old file untouched and a useless tmp file that recovery deletes; a kill after it leaves the new file.
+**Recoverability.** `open` reads frames and changes only two things: it writes the 8-byte header if the file is shorter than that (which can only be a kill during first creation, before anything was acknowledged), and it truncates the file to the end of the last good frame. Both are repeatable. A kill at any instruction in recovery leaves a file that the next recovery handles the same way, so recovery can recover from a crashed recovery. A frame the engine never finished can only be the last one in the file, because writes are serialised by the lock and each earlier frame was fsynced before the next write began.
 
 ---
 
-## Known gaps in this design (copy into BREAKING.md, section 3)
+## Known gaps (copy into BREAKING.md section 3)
 
-1. **Recovery time is linear in log length.** Without a checkpoint, 1M keys means scanning about 1M records. Planned fix if measured above 2 s: periodically append a CHECKPOINT record holding the whole index, and on open start scanning from the last valid checkpoint. Not built, so no table row depends on it.
-2. **A delete cannot be written when the file is at the cap and every byte is live**, because a DEL record needs space. Auto-compaction frees only dead bytes.
-3. **Compaction briefly needs up to twice the space**, because the cap applies to each file separately.
-4. **Rename atomicity and directory fsync are not verified on NTFS.** The design relies on `os.replace` being atomic; on Windows there is no directory fsync.
-5. **A bit flip in the middle of the log** would be treated as the end of the log and the rest discarded. Bit rot is out of scope per the problem statement, but this is what would happen.
+1. **No compaction.** The file only grows, so C3 to C5, E4 and E5 are unmet, and the PDF's file-shrink requirement fails (minus 5). This is the largest gap.
+2. **Recovery time is linear in file size.** Not measured at 1,000,000 keys; Python may exceed 2 seconds. A checkpoint frame holding an index snapshot is the planned fix.
+3. **Failed write in a live process.** If the OS fails a write halfway (a real disk error rather than the `--max-bytes` check), the file can end in a torn frame while the process keeps running. The next successful append would sit behind garbage and be unreachable at the next recovery. The engine should truncate back to the last good offset on any write error, or refuse further writes. Confirm what the code does.
+4. **Header is not checksummed.** A header of 8 bytes is written in one call, so a torn header is shorter than 8 bytes and is rewritten. A damaged but full-length header is rejected as "not a KVDB file".
+5. **CRC covers the payload, not the length.** A corrupted length field makes a frame look torn, so recovery discards it and everything after it. Bit rot is out of scope in the PDF, but this is what would happen.
+
+## Planned compaction (not built)
+
+Write live keys to a temp file, `fsync` it, `os.replace` it over the data file, then `fsync` the directory on Linux and macOS. On Windows the old file handle must be closed before the replace, and there is no directory fsync. Recovery gains one step: delete a leftover temp file. The rename is the commit point: before it the old file is authoritative, after it the new one is. Once built, this fills in C3 to C5, E4 and E5.
